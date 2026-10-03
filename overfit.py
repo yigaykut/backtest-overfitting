@@ -1,7 +1,8 @@
 """Was that a result, or was it the best of many tries?
 
-Two measures from Bailey and Lopez de Prado, implemented with numpy
-and the standard library only.
+Two measures from Bailey and Lopez de Prado, plus the frequency check
+that caught my own mistake. numpy and the standard library, nothing
+else.
 
 DEFLATED SHARPE RATIO
 ---------------------
@@ -11,9 +12,9 @@ differ from each other. The deflated Sharpe works out that bar and asks
 whether the observed Sharpe clears it.
 
 The bar is sqrt(V) * ((1-g)*Z(1-1/N) + g*Z(1-1/(N*e))), where V is the
-variance of the trial Sharpes and g is Euler's constant. So a grid where
-everything lands in the same place gets a low bar, and one that sprays
-gets a high one.
+variance of the trial Sharpes and g is Euler's constant. So a grid
+where everything lands in the same place gets a low bar, and one that
+sprays gets a high one.
 
 Skew and kurtosis go into the probability. Returns from real strategies
 are not normal, and ignoring that reads high.
@@ -28,8 +29,15 @@ below the median is the PBO.
 A PBO near 0.5 says "pick whatever won in training" is a coin flip.
 Near 0 says the selection is doing something.
 
-BOTH ARE DIAGNOSTICS. They do not improve a strategy. They tell you
-how to read the number it produced.
+SHARPE BY FREQUENCY
+-------------------
+Annualising a Sharpe assumes the observations are independent. If the
+equity curve was built by filling values forward between updates, they
+are not, and the number comes out several times too high. See
+`sharpe_by_frequency`.
+
+ALL THREE ARE DIAGNOSTICS. They do not improve a strategy. They tell
+you how to read the number it produced.
 
 IMPORTANT: pass every trial you ran, losers included. Handing it only
 the winners shrinks N, lowers the bar, and hides the exact bias you
@@ -46,9 +54,8 @@ import numpy as np
 def _normal_ppf(p: float) -> float:
     """Inverse normal CDF.
 
-    Acklam's approximation, so scipy stays out of the dependency
-    list. Absolute error around 1e-9, which is far more than this
-    needs.
+    Acklam's approximation, so scipy stays out of the dependency list.
+    Absolute error around 1e-9, far more than this needs.
     """
     if not 0.0 < p < 1.0:
         return float("nan")
@@ -76,139 +83,205 @@ def _normal_ppf(p: float) -> float:
 
 
 def _normal_cdf(z: float) -> float:
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0))) if np.isfinite(z) else float("nan")
+    if not np.isfinite(z):
+        return float("nan")
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
-def sharpe(seri: np.ndarray, yil_bar: float = 365.0) -> float:
-    """Annualised Sharpe. Risk-free rate is taken as zero."""
-    v = np.asarray(seri, dtype=float)
+def _usable(v: np.ndarray) -> "tuple[np.ndarray, float] | None":
+    """Finite values and their standard deviation, or None.
+
+    The threshold on sd is relative, not `sd > 0`. A constant series
+    does not give exactly zero: summing identical floats leaves a
+    residual around 1e-19, which slips through and makes the Sharpe
+    astronomically large but still finite.
+    """
+    v = np.asarray(v, dtype=float)
     v = v[np.isfinite(v)]
     if len(v) < 3:
-        return float("nan")
-    sd = v.std(ddof=1)
-    # GORELI esik. Sabit bir seride std tam sifir cikmiyor: ortalama
-    # kayan noktada birikince ~1e-19 kalinti kaliyor ve `sd > 0`
-    # kontrolu bunu geciriyor, Sharpe astronomik ama sonlu oluyor.
+        return None
+    sd = float(v.std(ddof=1))
     if not sd > 1e-12 * max(1.0, float(np.abs(v).mean())):
+        return None
+    return v, sd
+
+
+def sharpe(returns, periods_per_year: float = 365.0) -> float:
+    """Annualised Sharpe. Risk-free rate is taken as zero."""
+    u = _usable(returns)
+    if u is None:
         return float("nan")
-    return float(v.mean() / sd * math.sqrt(yil_bar))
+    v, sd = u
+    return float(v.mean() / sd * math.sqrt(periods_per_year))
 
 
-def olasilikli_sharpe(seri: np.ndarray, esik: float = 0.0,
-                      yil_bar: float = 365.0) -> float:
-    """Gözlenen Sharpe'ın `esik`i gerçekten aştığı olasılığı.
+def probabilistic_sharpe(returns, threshold: float = 0.0,
+                         periods_per_year: float = 365.0) -> float:
+    """Probability that the true Sharpe is above `threshold`.
 
-    Çarpıklık ve basıklık düzeltmeli. Normal olmayan bir seride bu
-    düzeltme olmadan olasılık yukarı kaçar -- negatif çarpıklık ve
-    kalın kuyruk Sharpe'ın standart hatasını büyütür.
+    Corrected for skew and kurtosis. Without that correction the
+    probability reads high on a non-normal series: negative skew and
+    fat tails both widen the standard error of a Sharpe.
     """
-    v = np.asarray(seri, dtype=float)
-    v = v[np.isfinite(v)]
+    u = _usable(returns)
+    if u is None:
+        return float("nan")
+    v, sd = u
     n = len(v)
-    if n < 3:
-        return float("nan")
-    sd = v.std(ddof=1)
-    if not sd > 1e-12 * max(1.0, float(np.abs(v).mean())):
-        return float("nan")
-    sr = v.mean() / sd                      # bar bazinda
-    sr_esik = esik / math.sqrt(yil_bar)
+    sr = v.mean() / sd                                  # per period
+    sr_threshold = threshold / math.sqrt(periods_per_year)
     z = (v - v.mean()) / sd
-    carpiklik = float((z ** 3).mean())
-    basiklik = float((z ** 4).mean())
-    payda = math.sqrt(max(1e-12,
-                          1 - carpiklik * sr + (basiklik - 1) / 4 * sr ** 2))
-    return _normal_cdf((sr - sr_esik) * math.sqrt(n - 1) / payda)
+    skew = float((z ** 3).mean())
+    kurt = float((z ** 4).mean())
+    denom = math.sqrt(max(1e-12,
+                          1 - skew * sr + (kurt - 1) / 4 * sr ** 2))
+    return _normal_cdf((sr - sr_threshold) * math.sqrt(n - 1) / denom)
 
 
-def sisirilmis_sharpe(seriler: "dict[str, np.ndarray] | list",
-                      secilen: "str | int | None" = None,
-                      yil_bar: float = 365.0) -> dict:
-    """Denenen bütün kurgular verilince en iyisinin gerçekliği.
+def deflated_sharpe(trials, selected=None,
+                    periods_per_year: float = 365.0) -> dict:
+    """How real the best of a set of trials is.
 
-    `seriler` denenen HER kurgunun getiri serisi. Eksik bırakmak
-    sonucu iyimser yapar: N küçüldükçe eşik düşer, yani yalnızca
-    kazananları vermek tam olarak ölçmeye çalıştığımız yanlılığı
-    gizler.
+    `trials` is the return series of EVERY configuration you ran, as a
+    dict of name -> returns or a list. Leaving any out makes the answer
+    optimistic: a smaller N means a lower bar, so handing it only the
+    winners hides the bias this is meant to measure.
     """
-    if isinstance(seriler, dict):
-        adlar, diziler = list(seriler.keys()), list(seriler.values())
+    if isinstance(trials, dict):
+        names, series = list(trials.keys()), list(trials.values())
     else:
-        adlar, diziler = list(range(len(seriler))), list(seriler)
-    sr = np.array([sharpe(x, yil_bar) for x in diziler], dtype=float)
-    gecerli = np.isfinite(sr)
-    if gecerli.sum() < 2:
-        return {"ok": False, "reason": "en az iki gecerli kurgu gerekli"}
-    n_deneme = int(gecerli.sum())
-    if secilen is None:
-        i = int(np.nanargmax(np.where(gecerli, sr, -np.inf)))
+        names, series = list(range(len(trials))), list(trials)
+    sr = np.array([sharpe(x, periods_per_year) for x in series], dtype=float)
+    ok = np.isfinite(sr)
+    if ok.sum() < 2:
+        return {"ok": False, "reason": "need at least two usable trials"}
+    n_trials = int(ok.sum())
+    if selected is None:
+        i = int(np.nanargmax(np.where(ok, sr, -np.inf)))
     else:
-        i = adlar.index(secilen) if isinstance(secilen, str) else int(secilen)
+        i = (names.index(selected) if isinstance(selected, str)
+             else int(selected))
 
-    # Denemelerin Sharpe yayilimi esigi belirliyor: butun kurgular ayni
-    # sonucu veriyorsa arama az sey kazandirmistir ve esik alcaktir.
-    v_sr = float(np.var(sr[gecerli], ddof=1))
+    # The spread of the trial Sharpes sets the bar: if every
+    # configuration lands in the same place the search bought little,
+    # and the bar is low.
+    var_sr = float(np.var(sr[ok], ddof=1))
     g = 0.5772156649015329
-    z1 = _normal_ppf(max(1e-12, min(1 - 1e-12, 1.0 - 1.0 / n_deneme)))
+    z1 = _normal_ppf(max(1e-12, min(1 - 1e-12, 1.0 - 1.0 / n_trials)))
     z2 = _normal_ppf(max(1e-12, min(1 - 1e-12,
-                                    1.0 - 1.0 / (n_deneme * math.e))))
-    beklenen_max = math.sqrt(max(0.0, v_sr)) * ((1 - g) * z1 + g * z2)
+                                    1.0 - 1.0 / (n_trials * math.e))))
+    expected_max = math.sqrt(max(0.0, var_sr)) * ((1 - g) * z1 + g * z2)
     return {
         "ok": True,
-        "secilen": adlar[i],
+        "selected": names[i],
         "sharpe": float(sr[i]),
-        "deneme": n_deneme,
-        "sharpe_yayilimi": math.sqrt(max(0.0, v_sr)),
-        # Beceri yoksa N denemenin en iyisinden BEKLENEN Sharpe.
-        "sans_esigi": float(beklenen_max),
-        "sisirilmis": float(olasilikli_sharpe(diziler[i], beklenen_max,
-                                              yil_bar)),
-        "olasilikli_sifira_karsi": float(olasilikli_sharpe(diziler[i], 0.0,
-                                                           yil_bar)),
+        "trials": n_trials,
+        "sharpe_spread": math.sqrt(max(0.0, var_sr)),
+        # What the best of N skill-less trials would be expected to show.
+        "chance_bar": float(expected_max),
+        "deflated": float(probabilistic_sharpe(series[i], expected_max,
+                                               periods_per_year)),
+        "vs_zero": float(probabilistic_sharpe(series[i], 0.0,
+                                              periods_per_year)),
     }
 
 
-def pbo(seriler: "dict[str, np.ndarray] | list", s_parca: int = 10) -> dict:
-    """Arka test aşırı uydurma olasılığı (CSCV).
+def pbo(trials, splits: int = 10) -> dict:
+    """Probability of backtest overfitting (CSCV).
 
-    Pencere `s_parca` eşit parçaya bölünür; yarısı eğitim yarısı test
-    olan bütün kombinasyonlarda eğitimin en iyisi seçilip testteki
-    yüzdelik sırasına bakılır. Ortanca sıranın altına düşme oranı PBO.
+    The sample is cut into `splits` pieces. For every way of using half
+    for training and half for testing, the training winner is picked
+    and its rank out of sample recorded. The share of splits where it
+    lands below the median is the PBO.
     """
-    if isinstance(seriler, dict):
-        diziler = list(seriler.values())
-    else:
-        diziler = list(seriler)
-    if len(diziler) < 2:
-        return {"ok": False, "reason": "en az iki kurgu gerekli"}
-    n = min(len(x) for x in diziler)
-    if s_parca % 2 or n < s_parca * 4:
-        return {"ok": False, "reason": f"{n} gozlem / {s_parca} parca yetersiz"}
-    M = np.array([np.asarray(x, dtype=float)[:n] for x in diziler])
-    kes = np.array_split(np.arange(n), s_parca)
+    series = list(trials.values()) if isinstance(trials, dict) else list(trials)
+    if len(series) < 2:
+        return {"ok": False, "reason": "need at least two trials"}
+    n = min(len(x) for x in series)
+    if splits % 2 or n < splits * 4:
+        return {"ok": False,
+                "reason": f"{n} observations over {splits} splits is too few"}
+    M = np.array([np.asarray(x, dtype=float)[:n] for x in series])
+    cuts = np.array_split(np.arange(n), splits)
 
-    mantik = []
-    for egitim in itertools.combinations(range(s_parca), s_parca // 2):
-        test = [j for j in range(s_parca) if j not in egitim]
-        ie = np.concatenate([kes[j] for j in egitim])
-        it = np.concatenate([kes[j] for j in test])
-        se = np.array([sharpe(M[k, ie]) for k in range(len(M))])
-        st = np.array([sharpe(M[k, it]) for k in range(len(M))])
-        if not np.isfinite(se).any() or not np.isfinite(st).any():
+    logits = []
+    for train in itertools.combinations(range(splits), splits // 2):
+        test = [j for j in range(splits) if j not in train]
+        i_tr = np.concatenate([cuts[j] for j in train])
+        i_te = np.concatenate([cuts[j] for j in test])
+        s_tr = np.array([sharpe(M[k, i_tr]) for k in range(len(M))])
+        s_te = np.array([sharpe(M[k, i_te]) for k in range(len(M))])
+        if not np.isfinite(s_tr).any() or not np.isfinite(s_te).any():
             continue
-        en_iyi = int(np.nanargmax(np.where(np.isfinite(se), se, -np.inf)))
-        gecerli = np.isfinite(st)
-        if gecerli.sum() < 2 or not np.isfinite(st[en_iyi]):
+        best = int(np.nanargmax(np.where(np.isfinite(s_tr), s_tr, -np.inf)))
+        ok = np.isfinite(s_te)
+        if ok.sum() < 2 or not np.isfinite(s_te[best]):
             continue
-        # Secilenin testteki yuzdelik sirasi; 0,5 ortanca.
-        w = float((st[gecerli] < st[en_iyi]).sum()) / float(gecerli.sum() - 1 or 1)
+        # Where the pick sits out of sample, as a percentile. 0.5 is the
+        # median.
+        w = float((s_te[ok] < s_te[best]).sum()) / float(ok.sum() - 1 or 1)
         w = min(max(w, 1e-9), 1 - 1e-9)
-        mantik.append(math.log(w / (1 - w)))
-    if not mantik:
-        return {"ok": False, "reason": "hicbir bolunme olculemedi"}
-    m = np.array(mantik)
+        logits.append(math.log(w / (1 - w)))
+    if not logits:
+        return {"ok": False, "reason": "no split could be measured"}
+    m = np.array(logits)
     return {
         "ok": True,
         "pbo": float((m <= 0).mean()),
-        "bolunme": len(m),
-        "ortanca_mantik": float(np.median(m)),
+        "splits": len(m),
+        "median_logit": float(np.median(m)),
+    }
+
+
+def sharpe_by_frequency(returns, blocks=(1, 5, 21, 35),
+                        periods_per_year: float = 365.0) -> dict:
+    """Is the annualised Sharpe an artifact of a smoothed curve?
+
+    Annualising assumes the observations are independent. An equity
+    curve assembled by filling values forward between updates breaks
+    that badly, and the Sharpe comes out several times too high.
+
+    This compounds the series into non-overlapping blocks of each given
+    length and reports the Sharpe of each. A real daily series gives
+    roughly the same number at every block size. A forward-filled one
+    gives a large number at block 1 that collapses as the blocks grow,
+    and that collapse is the measure of how much was borrowed.
+
+    `lag1` is the first-order autocorrelation. Near zero is what a
+    genuine return series looks like. Anything above about 0.3 means
+    the block-1 Sharpe cannot be trusted.
+    """
+    u = _usable(returns)
+    if u is None:
+        return {"ok": False, "reason": "series not usable"}
+    v, _ = u
+    if len(v) < 30:
+        return {"ok": False, "reason": f"{len(v)} observations is too few"}
+    lag1 = float(np.corrcoef(v[:-1], v[1:])[0, 1]) if len(v) > 2 else float("nan")
+
+    out = {}
+    for b in blocks:
+        b = int(b)
+        if b < 1 or len(v) // b < 10:
+            continue
+        cut = (len(v) // b) * b
+        agg = np.prod(1.0 + v[:cut].reshape(-1, b), axis=1) - 1.0
+        out[b] = float(sharpe(agg, periods_per_year / b))
+    if not out:
+        return {"ok": False, "reason": "no block size had enough data"}
+
+    vals = [x for x in out.values() if np.isfinite(x)]
+    # Effective sample size under AR(1): n * (1-rho) / (1+rho).
+    eff = (len(v) * (1 - lag1) / (1 + lag1)
+           if np.isfinite(lag1) and lag1 > -1 else float("nan"))
+    return {
+        "ok": True,
+        "lag1": lag1,
+        "n": len(v),
+        "effective_n": float(eff),
+        "by_block": out,
+        # How much the shortest block borrows from the longest.
+        "inflation": (float(max(vals) / min(vals))
+                      if vals and min(vals) > 0 else float("nan")),
+        "suspect": bool(np.isfinite(lag1) and lag1 > 0.3),
     }
